@@ -1,19 +1,22 @@
 #!/bin/sh
 # qnap-storage-advisor.sh
 # Analysiert Storage-Konfiguration auf QNAP NAS
-# und gibt Empfehlungen für HDD-Sleep, SSD-Caching, Container-Workloads
+# und gibt Empfehlungen fuer HDD-Sleep, SSD-Caching, Container-Workloads
 #
-# Usage: sh qnap-storage-advisor.sh [--json]
+# Usage: sh qnap-storage-advisor.sh
 #
-# License: AGPLv3 — https://www.gnu.org/licenses/agpl-3.0.html
+# Kompatibel mit: busybox ash (QNAP QTS), dash, bash
+#
+# License: AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
 # Copyright (c) 2026 GrEEV.com KG
 
-set -u
+# Kein set -u — busybox ash reagiert bei leeren Variablen zu streng
 
-JSON_MODE=0
-[ "${1:-}" = "--json" ] && JSON_MODE=1
+EXIT_CODE=0
+WARNINGS=0
+RECOMMENDATIONS=""
 
-# ── Farben (werden deaktiviert wenn kein TTY) ──────────────────────────────────
+# ── Farben (nur bei echtem TTY) ───────────────────────────────────────────────
 if [ -t 1 ]; then
   C_RESET='\033[0m'
   C_OK='\033[0;32m'
@@ -25,21 +28,17 @@ else
   C_RESET=''; C_OK=''; C_WARN=''; C_FAIL=''; C_INFO=''; C_BOLD=''
 fi
 
-EXIT_CODE=0
-WARNINGS=0
-RECOMMENDATIONS=''
-
-say()  { printf '%b%s%b\n' "$C_BOLD" "$*" "$C_RESET"; }
-ok()   { printf '%b[ OK ]%b %s\n' "$C_OK" "$C_RESET" "$*"; }
-info() { printf '%b[INFO]%b %s\n' "$C_INFO" "$C_RESET" "$*"; }
-warn() { printf '%b[WARN]%b %s\n' "$C_WARN" "$C_RESET" "$*"; WARNINGS=$((WARNINGS+1)); }
-fail() { printf '%b[FAIL]%b %s\n' "$C_FAIL" "$C_RESET" "$*"; EXIT_CODE=1; }
+say()  { printf "${C_BOLD}%s${C_RESET}\n" "$*"; }
+ok()   { printf "${C_OK}[ OK ]${C_RESET} %s\n" "$*"; }
+info() { printf "${C_INFO}[INFO]${C_RESET} %s\n" "$*"; }
+warn() { printf "${C_WARN}[WARN]${C_RESET} %s\n" "$*"; WARNINGS=$((WARNINGS+1)); }
+fail() { printf "${C_FAIL}[FAIL]${C_RESET} %s\n" "$*"; EXIT_CODE=1; }
 rec()  {
-  printf '%b[REC ]%b %s\n' "$C_WARN" "$C_RESET" "$*"
-  RECOMMENDATIONS="${RECOMMENDATIONS}\n  → $*"
+  printf "${C_WARN}[REC ]${C_RESET} %s\n" "$*"
+  RECOMMENDATIONS="${RECOMMENDATIONS}
+  -> $*"
 }
-
-hr()   { printf '%s\n' "──────────────────────────────────────────────────"; }
+hr() { printf '%s\n' "--------------------------------------------------"; }
 
 # ── Header ────────────────────────────────────────────────────────────────────
 print_header() {
@@ -49,8 +48,9 @@ print_header() {
   hr
   info "Datum    : $(date '+%Y-%m-%d %H:%M:%S')"
   info "Hostname : $(hostname)"
-  info "QTS      : $(cat /etc/version 2>/dev/null | head -1 || echo 'unbekannt')"
-  say
+  QTS_VER=$(cat /etc/version 2>/dev/null | head -1)
+  info "QTS      : ${QTS_VER:-unbekannt}"
+  printf '\n'
 }
 
 # ── 1. Disk-Typen erkennen ────────────────────────────────────────────────────
@@ -62,22 +62,20 @@ check_disk_types() {
   SSD_COUNT=0
   NVME_COUNT=0
 
-  for dev in /sys/block/sd* /sys/block/nvme* 2>/dev/null; do
+  # Glob separat auswerten — kein 2>/dev/null im for-Statement
+  for dev in /sys/block/sd* /sys/block/nvme*; do
     [ -e "$dev" ] || continue
-    DEVNAME=$(basename "$dev")
-    ROT_FILE="$dev/queue/rotational"
-    ROT=1
-    [ -f "$ROT_FILE" ] && ROT=$(cat "$ROT_FILE")
 
-    # Größe in GB
+    DEVNAME=$(basename "$dev")
+    ROT=1
+    [ -f "$dev/queue/rotational" ] && ROT=$(cat "$dev/queue/rotational")
+
     SIZE_SECTORS=0
     [ -f "$dev/size" ] && SIZE_SECTORS=$(cat "$dev/size")
     SIZE_GB=$(( SIZE_SECTORS / 2 / 1024 / 1024 ))
 
-    # Modell
     MODEL="unbekannt"
-    [ -f "$dev/device/model" ] && MODEL=$(cat "$dev/device/model" | tr -d '\n')
-    [ -f "$dev/../device/model" ] && MODEL=$(cat "$dev/../device/model" | tr -d '\n' 2>/dev/null || echo "$MODEL")
+    [ -f "$dev/device/model" ] && MODEL=$(tr -d '\n' < "$dev/device/model")
 
     case "$DEVNAME" in
       nvme*)
@@ -96,16 +94,16 @@ check_disk_types() {
     esac
   done
 
-  say
-  info "Zusammenfassung: ${HDD_COUNT}× HDD, ${SSD_COUNT}× SATA-SSD, ${NVME_COUNT}× NVMe"
+  printf '\n'
+  info "Zusammenfassung: ${HDD_COUNT}x HDD, ${SSD_COUNT}x SATA-SSD, ${NVME_COUNT}x NVMe"
 
   if [ "$SSD_COUNT" -eq 0 ] && [ "$NVME_COUNT" -eq 0 ]; then
     warn "Keine SSD/NVMe erkannt — nur HDDs vorhanden"
-    rec "SSD/NVMe kaufen: 1× M.2 NVMe (250–500GB) für Docker-Volumes (db, redis) → HDD kann dann schlafen"
+    rec "SSD/NVMe kaufen: 1x M.2 NVMe (250-500GB) fuer Docker-Volumes (db, redis) -> HDD kann dann schlafen"
   else
     ok "Mindestens eine SSD/NVMe vorhanden"
   fi
-  say
+  printf '\n'
 }
 
 # ── 2. RAID / MDSTAT ─────────────────────────────────────────────────────────
@@ -114,7 +112,7 @@ check_raid() {
   hr
 
   if [ -f /proc/mdstat ]; then
-    cat /proc/mdstat | grep -v '^Personalities\|^unused\|^$' | while read -r line; do
+    grep -v '^Personalities\|^unused\|^$' /proc/mdstat | while read -r line; do
       info "$line"
     done
     RAID_DEVICES=$(grep -c '^md' /proc/mdstat 2>/dev/null || echo 0)
@@ -122,7 +120,7 @@ check_raid() {
   else
     info "/proc/mdstat nicht gefunden (ggf. QNAP Hardware-RAID)"
   fi
-  say
+  printf '\n'
 }
 
 # ── 3. Mount-Punkte & Speicher ───────────────────────────────────────────────
@@ -134,23 +132,21 @@ check_mounts() {
     info "$line"
   done
 
-  # CACHEDEV1_DATA prüfen
   CACHE_DEV=$(df /share/CACHEDEV1_DATA 2>/dev/null | tail -1 | awk '{print $1}')
   if [ -n "$CACHE_DEV" ]; then
     info "Container/Docker liegt auf: $CACHE_DEV"
-    # Rotational check für das Device
     DEVBASE=$(echo "$CACHE_DEV" | sed 's|/dev/||;s|[0-9]*$||')
     if [ -f "/sys/block/$DEVBASE/queue/rotational" ]; then
       ROT=$(cat "/sys/block/$DEVBASE/queue/rotational")
       if [ "$ROT" = "1" ]; then
         warn "Docker-Root ($CACHE_DEV) liegt auf einer HDD!"
-        rec "Docker db/ und redis/ Volumes auf SSD verschieben → verhindert dass HDD wegen DB-I/O nie schlafen kann"
+        rec "Docker db/ und redis/ Volumes auf SSD verschieben -> HDD kann schlafen"
       else
-        ok "Docker-Root ($CACHE_DEV) liegt auf SSD/NVMe — gut für Container-Workloads"
+        ok "Docker-Root ($CACHE_DEV) liegt auf SSD/NVMe — gut fuer Container-Workloads"
       fi
     fi
   fi
-  say
+  printf '\n'
 }
 
 # ── 4. Docker-Root prüfen ────────────────────────────────────────────────────
@@ -161,98 +157,94 @@ check_docker_root() {
   if command -v docker >/dev/null 2>&1; then
     DOCKER_ROOT=$(docker info 2>/dev/null | grep 'Docker Root Dir' | awk '{print $NF}')
     STORAGE_DRIVER=$(docker info 2>/dev/null | grep 'Storage Driver' | awk '{print $NF}')
-    info "Docker Root Dir   : ${DOCKER_ROOT:-unbekannt}"
-    info "Storage Driver    : ${STORAGE_DRIVER:-unbekannt}"
+    info "Docker Root Dir : ${DOCKER_ROOT:-unbekannt}"
+    info "Storage Driver  : ${STORAGE_DRIVER:-unbekannt}"
 
     if [ -n "$DOCKER_ROOT" ]; then
       DEVBASE=$(df "$DOCKER_ROOT" 2>/dev/null | tail -1 | awk '{print $1}' | sed 's|/dev/||;s|[0-9]*$||')
       if [ -f "/sys/block/$DEVBASE/queue/rotational" ]; then
         ROT=$(cat "/sys/block/$DEVBASE/queue/rotational")
         if [ "$ROT" = "1" ]; then
-          warn "Docker Root liegt auf HDD → Container-I/O verhindert HDD-Sleep"
-          rec "Docker Root auf SSD verschieben: Container Station → Einstellungen → Speicherpfad"
+          warn "Docker Root liegt auf HDD -> Container-I/O verhindert HDD-Sleep"
+          rec "Docker Root auf SSD verschieben: Container Station -> Einstellungen -> Speicherpfad"
         else
           ok "Docker Root liegt auf SSD/NVMe"
         fi
       fi
     fi
   else
-    info "Docker nicht gefunden — überspringe Docker-Root-Check"
+    info "Docker nicht gefunden — ueberspringe Docker-Root-Check"
   fi
-  say
+  printf '\n'
 }
 
 # ── 5. HDD-Sleep-Killer erkennen ─────────────────────────────────────────────
 check_hdd_sleep_killers() {
-  say "[5/7] HDD-Sleep-Killer (Prozesse die HDD wach halten)"
+  say "[5/7] HDD-Sleep-Killer"
   hr
 
-  # laufende Container
   if command -v docker >/dev/null 2>&1; then
     RUNNING=$(docker ps --format '{{.Names}}' 2>/dev/null)
     if [ -n "$RUNNING" ]; then
-      warn "Laufende Container: $(echo $RUNNING | tr '\n' ' ')"
-      warn "Container mit 'restart: unless-stopped' halten durch periodischen I/O die HDD wach"
-      rec "Paperless-Volumes aufteilen: db/ + redis/ → SSD, media/ + consume/ + export/ → HDD"
-      rec "Damit kann die HDD schlafen wenn keine Dokumente verarbeitet werden"
+      warn "Laufende Container: $(echo "$RUNNING" | tr '\n' ' ')"
+      warn "Container mit restart:unless-stopped halten HDD durch periodischen I/O wach"
+      rec "Paperless-Volumes aufteilen: db/ + redis/ -> SSD, media/ + consume/ + export/ -> HDD"
     else
       ok "Keine laufenden Container — HDD kann schlafen"
     fi
   fi
 
-  # Syslog / rsyslog Schreibaktivität
   if [ -f /var/log/messages ]; then
-    SYSLOG_WRITES=$(ls -la /var/log/messages | awk '{print $5}')
-    info "/var/log/messages Größe: ${SYSLOG_WRITES} Bytes"
-    info "Tipp: Syslog auf tmpfs/RAM-Disk → reduziert HDD-Schreibzugriffe"
+    SYSLOG_SIZE=$(ls -la /var/log/messages | awk '{print $5}')
+    info "/var/log/messages: ${SYSLOG_SIZE} Bytes"
+    info "Tipp: Syslog auf tmpfs/RAM-Disk -> reduziert HDD-Schreibzugriffe"
   fi
 
-  # Thumbnail-/Preview-Dienste
   for svc in mediasrv photostation qmultimedia; do
     if pgrep -x "$svc" >/dev/null 2>&1; then
-      warn "Dienst '$svc' läuft — kann HDD durch Thumbnail-Generierung wach halten"
-      rec "'$svc' deaktivieren falls nicht benötigt: App Center → Multimedia-Station"
+      warn "Dienst '$svc' laeuft — kann HDD wach halten"
+      rec "'$svc' deaktivieren falls nicht benoetigt: App Center -> Multimedia-Station"
     fi
   done
 
-  say
+  printf '\n'
 }
 
-# ── 6. Paperless-Volume-Analyse ──────────────────────────────────────────────
+# ── 6. Paperless-Volume-Empfehlung ───────────────────────────────────────────
 check_paperless_volumes() {
   say "[6/7] Paperless-Volume-Empfehlung"
   hr
 
-  BASE_DIR="${BASE_DIR:-/share/Container/paperless-ngx}"
-  info "Geplanter BASE_DIR: $BASE_DIR"
+  PBASE="${BASE_DIR:-/share/Container/paperless-ngx}"
+  info "Geplanter BASE_DIR: $PBASE"
 
-  # Prüfe ob BASE_DIR auf SSD oder HDD liegt
-  DEVBASE=$(df "$(dirname $BASE_DIR)" 2>/dev/null | tail -1 | awk '{print $1}' | sed 's|/dev/||;s|[0-9]*$||')
+  PARENT=$(dirname "$PBASE")
+  DEVBASE=$(df "$PARENT" 2>/dev/null | tail -1 | awk '{print $1}' | sed 's|/dev/||;s|[0-9]*$||')
+
   if [ -f "/sys/block/$DEVBASE/queue/rotational" ]; then
     ROT=$(cat "/sys/block/$DEVBASE/queue/rotational")
     if [ "$ROT" = "1" ]; then
       warn "Paperless BASE_DIR wird auf HDD liegen"
-      say
-      info "Empfohlene Volume-Aufteilung (SSD + HDD):"
-      info "  SSD → db/     (Postgres: häufige kleine Schreibzugriffe)"
-      info "  SSD → redis/  (Redis: Write-Ahead-Log, Snapshots)"
-      info "  SSD → data/   (Paperless-Metadaten, SQLite-Fallback)"
-      info "  HDD → media/  (Gescannte Dokumente, PDFs — seltener Zugriff)"
-      info "  HDD → consume/(Eingangs-Ordner — nur bei neuem Scan aktiv)"
-      info "  HDD → export/ (Backup-Export — manuell/geplant)"
-      rec "Kauf-Empfehlung: 1× M.2 NVMe SSD (250GB reicht) für db/, redis/, data/"
-      rec "Damit schläft die HDD >90% der Zeit — nur beim Scannen aktiv"
+      printf '\n'
+      info "Empfohlene Volume-Aufteilung:"
+      info "  SSD -> db/      (Postgres: haeufige kleine Schreibzugriffe)"
+      info "  SSD -> redis/   (Redis: WAL, Snapshots)"
+      info "  SSD -> data/    (Paperless-Metadaten, Suchindex)"
+      info "  HDD -> media/   (PDFs — seltener Zugriff)"
+      info "  HDD -> consume/ (Eingangs-Ordner — nur beim Scannen aktiv)"
+      info "  HDD -> export/  (Backup-Export — manuell/geplant)"
+      rec "Kauf-Empfehlung: 1x M.2 NVMe SSD (250GB) fuer db/, redis/, data/"
+      rec "Damit schlaeft die HDD >90% der Zeit — nur beim Scannen aktiv"
     else
       ok "Paperless BASE_DIR liegt auf SSD/NVMe — optimale Konfiguration"
-      info "Alle Volumes können auf dem SSD-Volume bleiben"
     fi
   else
-    info "Kann Storage-Typ für '$BASE_DIR' nicht bestimmen (Device: $DEVBASE)"
+    info "Kann Storage-Typ nicht bestimmen (Device: $DEVBASE) — manuell pruefen"
   fi
-  say
+  printf '\n'
 }
 
-# ── 7. Zusammenfassung & Empfehlungen ────────────────────────────────────────
+# ── 7. Zusammenfassung ────────────────────────────────────────────────────────
 print_summary() {
   hr
   say " ZUSAMMENFASSUNG"
@@ -265,13 +257,13 @@ print_summary() {
   fi
 
   if [ -n "$RECOMMENDATIONS" ]; then
-    say
+    printf '\n'
     say " EMPFEHLUNGEN:"
-    printf '%b\n' "$RECOMMENDATIONS"
+    printf '%s\n' "$RECOMMENDATIONS"
   fi
 
-  say
-  info "Vollständige Doku: https://github.com/KonradLanz/qnap-storage-advisor"
+  printf '\n'
+  info "Doku: https://github.com/KonradLanz/qnap-storage-advisor"
   hr
 }
 
