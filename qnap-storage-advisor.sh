@@ -4,15 +4,60 @@
 # und gibt Empfehlungen fuer HDD-Sleep, SSD-Caching, Container-Workloads
 #
 # Usage:
-#   sh qnap-storage-advisor.sh           # einmaliger Check
-#   sh qnap-storage-advisor.sh --watch   # HDD-I/O-Daemon (Strg+C zum Beenden)
+#   sh qnap-storage-advisor.sh                      # einmaliger Check (auto-detect)
+#   sh qnap-storage-advisor.sh --config nas.conf    # mit NAS-spezifischer Config
+#   sh qnap-storage-advisor.sh --detect             # Config-Vorlage generieren
+#   sh qnap-storage-advisor.sh --watch              # HDD-I/O-Daemon
+#   sh qnap-storage-advisor.sh --watch --config nas.conf
 #
 # Kompatibel mit: busybox ash (QNAP QTS), dash, bash
 #
 # License: AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
 # Copyright (c) 2026 GrEEV.com KG
 
-MODE="${1:-}"
+# ---------------------------------------------------------------------------
+# Argumente parsen
+# ---------------------------------------------------------------------------
+MODE=""
+CONFIG_FILE=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --watch)  MODE="watch" ;;
+    --detect) MODE="detect" ;;
+    --config) ;; # naechstes Argument ist der Pfad
+    *)
+      if [ -n "$_EXPECT_CONFIG" ]; then
+        CONFIG_FILE="$arg"
+        _EXPECT_CONFIG=""
+      fi
+      ;;
+  esac
+  [ "$arg" = "--config" ] && _EXPECT_CONFIG=1
+done
+
+# ---------------------------------------------------------------------------
+# Defaults (werden ggf. durch nas.conf ueberschrieben)
+# ---------------------------------------------------------------------------
+NAS_LABEL="QNAP NAS"
+PAPERLESS_BASE="/share/Container/paperless-ngx"
+SSD_MOUNTS=""     # leer = automatisch via /sys/block
+HDD_MOUNTS=""     # leer = automatisch via /sys/block
+EXTRA_SLEEP_KILLERS=""
+
+# ---------------------------------------------------------------------------
+# Config-Datei laden (falls angegeben)
+# ---------------------------------------------------------------------------
+if [ -n "$CONFIG_FILE" ]; then
+  if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck source=/dev/null
+    . "$CONFIG_FILE"
+  else
+    printf 'FEHLER: Config-Datei nicht gefunden: %s\n' "$CONFIG_FILE" >&2
+    exit 1
+  fi
+fi
+
 EXIT_CODE=0
 WARNINGS=0
 RECOMMENDATIONS=""
@@ -46,9 +91,7 @@ hr() { printf '%s\n' "--------------------------------------------------"; }
 # Funktioniert mit /dev/sdX, /dev/mdX und Symlinks
 path_is_rotational() {
   TARGET="$1"
-  # echtes Device holen (folgt Symlinks)
   REALDEV=$(df "$TARGET" 2>/dev/null | tail -1 | awk '{print $1}')
-  # nur /dev/... Eintraege sind auswertbar
   case "$REALDEV" in
     /dev/*) ;;
     *) echo "unknown"; return ;;
@@ -56,33 +99,49 @@ path_is_rotational() {
 
   DEVNAME=$(basename "$REALDEV")
 
-  # Direkt /sys/block verfuegbar? (sdX, nvmeX)
   if [ -f "/sys/block/$DEVNAME/queue/rotational" ]; then
     cat "/sys/block/$DEVNAME/queue/rotational"
     return
   fi
 
-  # md-RAID: alle Mitglieder pruefen -> wenn eines rotational ist -> HDD
-  # Partition-Suffix abschneiden: md1p1 -> md1, md322 -> md322
+  # md-RAID: alle Member pruefen -> wenn eines rotational -> HDD
   MDBASE=$(echo "$DEVNAME" | sed 's/p[0-9]*$//' | grep '^md')
   if [ -n "$MDBASE" ] && [ -d "/sys/block/$MDBASE/slaves" ]; then
     for slave in /sys/block/$MDBASE/slaves/*; do
       [ -e "$slave" ] || continue
-      SLAVE_DEV=$(basename "$slave")
-      # Slave kann sdbN sein -> strip Ziffer am Ende fuer /sys/block
-      SLAVE_BASE=$(echo "$SLAVE_DEV" | sed 's/[0-9]*$//')
+      SLAVE_BASE=$(basename "$slave" | sed 's/[0-9]*$//')
       if [ -f "/sys/block/$SLAVE_BASE/queue/rotational" ]; then
         ROT=$(cat "/sys/block/$SLAVE_BASE/queue/rotational")
         if [ "$ROT" = "1" ]; then
-          echo "1"; return  # mindestens ein HDD-Mitglied -> HDD-Array
+          echo "1"; return
         fi
       fi
     done
-    echo "0"  # alle Mitglieder SSD
+    echo "0"
     return
   fi
 
   echo "unknown"
+}
+
+# ── Dynamische Mount-Erkennung ────────────────────────────────────────────────
+# Befuellt SSD_MOUNTS und HDD_MOUNTS falls nicht via Config gesetzt
+build_mount_lists() {
+  if [ -n "$SSD_MOUNTS" ] || [ -n "$HDD_MOUNTS" ]; then
+    return  # Config-Werte haben Vorrang
+  fi
+
+  for mnt in /share/CACHEDEV*_DATA /share/CE_CACHEDEV*_DATA; do
+    [ -d "$mnt" ] || continue
+    ROT=$(path_is_rotational "$mnt")
+    case "$ROT" in
+      0) SSD_MOUNTS="$SSD_MOUNTS $mnt" ;;
+      1) HDD_MOUNTS="$HDD_MOUNTS $mnt" ;;
+    esac
+  done
+
+  SSD_MOUNTS=$(echo "$SSD_MOUNTS" | sed 's/^ *//')
+  HDD_MOUNTS=$(echo "$HDD_MOUNTS" | sed 's/^ *//')
 }
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -93,8 +152,14 @@ print_header() {
   hr
   info "Datum    : $(date '+%Y-%m-%d %H:%M:%S')"
   info "Hostname : $(hostname)"
-  QTS_VER=$(cat /etc/version 2>/dev/null | head -1)
+  info "NAS      : $NAS_LABEL"
+  QTS_VER=$(head -1 /etc/version 2>/dev/null)
   info "QTS      : ${QTS_VER:-unbekannt}"
+  if [ -n "$CONFIG_FILE" ]; then
+    info "Config   : $CONFIG_FILE"
+  else
+    info "Config   : (auto-detect)"
+  fi
   printf '\n'
 }
 
@@ -168,8 +233,8 @@ check_mounts() {
   done
 
   printf '\n'
-  # Jedes CACHEDEV pruefen
-  for mnt in /share/CACHEDEV1_DATA /share/CACHEDEV2_DATA /share/CE_CACHEDEV4_DATA; do
+  info "Volume-Typen (dynamisch erkannt):"
+  for mnt in /share/CACHEDEV*_DATA /share/CE_CACHEDEV*_DATA; do
     [ -d "$mnt" ] || continue
     ROT=$(path_is_rotational "$mnt")
     LABEL=$(basename "$mnt")
@@ -220,7 +285,9 @@ check_hdd_sleep_killers() {
       ok "Keine laufenden Container"
     fi
   fi
-  for svc in mediasrv photostation qmultimedia Qsirch; do
+
+  DEFAULT_KILLERS="mediasrv photostation qmultimedia Qsirch"
+  for svc in $DEFAULT_KILLERS $EXTRA_SLEEP_KILLERS; do
     if pgrep -x "$svc" >/dev/null 2>&1; then
       warn "Dienst '$svc' laeuft -- kann HDD wach halten"
       rec "'$svc' nachts deaktivieren oder auf SSD-Volume verweisen"
@@ -233,10 +300,9 @@ check_hdd_sleep_killers() {
 check_paperless_volumes() {
   say "[6/8] Paperless-Volume-Empfehlung"
   hr
-  PBASE="${BASE_DIR:-/share/Container/paperless-ngx}"
-  info "Geplanter BASE_DIR: $PBASE"
+  info "Geplanter BASE_DIR: $PAPERLESS_BASE"
 
-  PARENT=$(dirname "$PBASE")
+  PARENT=$(dirname "$PAPERLESS_BASE")
   ROT=$(path_is_rotational "$PARENT")
   case "$ROT" in
     0)
@@ -246,13 +312,19 @@ check_paperless_volumes() {
       warn "Paperless BASE_DIR wird auf HDD liegen"
       printf '\n'
       info "Empfohlene Volume-Aufteilung:"
-      info "  SSD -> db/      (Postgres: haeufige kleine Schreibzugriffe)"
-      info "  SSD -> redis/   (Redis: WAL, Snapshots)"
-      info "  SSD -> data/    (Paperless-Metadaten, Suchindex)"
-      info "  HDD -> media/   (PDFs -- seltener Zugriff)"
-      info "  HDD -> consume/ (Eingangs-Ordner -- nur beim Scannen)"
-      info "  HDD -> export/  (Backup-Export -- manuell/geplant)"
-      rec "Paperless db/ + redis/ + data/ nach /share/CACHEDEV2_DATA/paperless/ verschieben"
+      # SSD-Mount fuer DB-Volumes ermitteln
+      BEST_SSD=$(echo "$SSD_MOUNTS" | awk '{print $1}')
+      BEST_HDD=$(echo "$HDD_MOUNTS" | awk '{print $1}')
+      SSD_BASE="${BEST_SSD:-/share/CACHEDEV2_DATA}"
+      HDD_BASE="${BEST_HDD:-/share/CACHEDEV1_DATA}"
+      PNAME=$(basename "$PAPERLESS_BASE")
+      info "  SSD -> ${SSD_BASE}/${PNAME}/db/      (Postgres)"
+      info "  SSD -> ${SSD_BASE}/${PNAME}/redis/   (Redis)"
+      info "  SSD -> ${SSD_BASE}/${PNAME}/data/    (Suchindex)"
+      info "  HDD -> ${HDD_BASE}/${PNAME}/media/   (PDFs)"
+      info "  HDD -> ${HDD_BASE}/${PNAME}/consume/ (Eingang)"
+      info "  HDD -> ${HDD_BASE}/${PNAME}/export/  (Backup)"
+      rec "Paperless db/ + redis/ + data/ nach ${SSD_BASE}/${PNAME}/ verschieben"
       ;;
     *)
       info "Kann Storage-Typ nicht bestimmen -- manuell pruefen"
@@ -261,40 +333,47 @@ check_paperless_volumes() {
   printf '\n'
 }
 
-# ── 7. Spezifische Empfehlung fuer dein Setup ────────────────────────────────
+# ── 7. Setup-Empfehlung ───────────────────────────────────────────────────────
 check_setup_recommendation() {
-  say "[7/8] Setup-Empfehlung (dein NAS)"
+  say "[7/8] Setup-Empfehlung"
   hr
-  # Wir wissen: sda=SSD->md2->CACHEDEV2, sdb-sdg=HDD->md1->CACHEDEV1
-  if [ -d /sys/block/sda ] && [ -d /sys/block/sdb ]; then
-    SDA_ROT=$(cat /sys/block/sda/queue/rotational 2>/dev/null || echo "1")
-    SDB_ROT=$(cat /sys/block/sdb/queue/rotational 2>/dev/null || echo "1")
-    if [ "$SDA_ROT" = "0" ] && [ "$SDB_ROT" = "1" ]; then
-      info "Erkannt: sda=SSD-Pool, sdb-sdg=HDD-RAID6-Pool"
-      printf '\n'
-      info "Optimale Paperless-Konfiguration fuer dieses NAS:"
-      info "  /share/CACHEDEV2_DATA/paperless/db/      <- Postgres"
-      info "  /share/CACHEDEV2_DATA/paperless/redis/   <- Redis"
-      info "  /share/CACHEDEV2_DATA/paperless/data/    <- Suchindex"
-      info "  /share/CACHEDEV1_DATA/paperless/media/   <- Dokumente (HDD)"
-      info "  /share/CACHEDEV1_DATA/paperless/consume/ <- Eingang (HDD)"
-      info "  /share/CACHEDEV1_DATA/paperless/export/  <- Export (HDD)"
-      printf '\n'
-      ok "Kein SSD-Kauf noetig -- CACHEDEV2_DATA (sda, 465GB) reicht fuer DB-Volumes"
-      ok "HDD-RAID kann schlafen sobald db/redis auf SSD liegen"
-    fi
+
+  if [ -z "$SSD_MOUNTS" ] && [ -z "$HDD_MOUNTS" ]; then
+    info "Keine Volumes klassifiziert -- pruefen ob /share/CACHEDEV*_DATA existiert"
+    printf '\n'
+    return
+  fi
+
+  PNAME=$(basename "$PAPERLESS_BASE")
+
+  info "NAS: $NAS_LABEL"
+  printf '\n'
+
+  if [ -n "$SSD_MOUNTS" ]; then
+    info "SSD-Volumes:  $SSD_MOUNTS"
+    BEST_SSD=$(echo "$SSD_MOUNTS" | awk '{print $1}')
+    info "  -> DB-Tier: ${BEST_SSD}/${PNAME}/{db,redis,data}"
+  fi
+
+  if [ -n "$HDD_MOUNTS" ]; then
+    info "HDD-Volumes:  $HDD_MOUNTS"
+    BEST_HDD=$(echo "$HDD_MOUNTS" | awk '{print $1}')
+    info "  -> Daten-Tier: ${BEST_HDD}/${PNAME}/{media,consume,export}"
+  fi
+
+  printf '\n'
+  if [ -n "$SSD_MOUNTS" ]; then
+    ok "SSD vorhanden -- HDD-RAID kann schlafen sobald db/redis auf SSD liegen"
+    ok "Kein SSD-Kauf noetig"
   fi
   printf '\n'
 }
 
-# ── 8. HDD I/O Activity Daemon ───────────────────────────────────────────────
-# Liest /proc/diskstats und zeigt welche Prozesse auf HDDs schreiben
-# Mit --watch: Dauerschleife bis Strg+C
+# ── 8. HDD I/O Activity ──────────────────────────────────────────────────────
 check_hdd_io() {
   say "[8/8] HDD I/O Aktivitaet"
   hr
 
-  # HDDs aus /sys/block ermitteln
   HDD_DEVS=""
   for dev in /sys/block/sd*; do
     [ -e "$dev" ] || continue
@@ -314,12 +393,10 @@ check_hdd_io() {
   info "Ueberwachte HDDs:$HDD_DEVS"
   printf '\n'
 
-  if [ "$MODE" = "--watch" ]; then
+  if [ "$MODE" = "watch" ]; then
     say "  Druecke Strg+C zum Beenden -- Intervall: 5 Sekunden"
-    say "  Zeigt Prozesse mit I/O auf HDD-Devices"
     hr
 
-    # Snapshot 1
     snap_diskstats() {
       for d in $HDD_DEVS; do
         grep " $d " /proc/diskstats 2>/dev/null | awk '{print $3, $6, $10}'
@@ -332,7 +409,6 @@ check_hdd_io() {
       CURR=$(snap_diskstats)
       ACTIVE_DEVS=""
 
-      # Vergleiche reads+writes zwischen Snapshots
       for d in $HDD_DEVS; do
         PREV_RW=$(echo "$PREV" | grep "^$d " | awk '{print $2+$3}')
         CURR_RW=$(echo "$CURR" | grep "^$d " | awk '{print $2+$3}')
@@ -347,8 +423,8 @@ check_hdd_io() {
       TIMESTAMP=$(date '+%H:%M:%S')
       if [ -n "$ACTIVE_DEVS" ]; then
         printf "${CWN}%s  HDD aktiv:${R} %s\n" "$TIMESTAMP" "$ACTIVE_DEVS"
-        # Prozesse mit offenen Dateien auf HDD-Mounts
-        for mnt in /share/CACHEDEV1_DATA /share/CACHEDEV8_DATA; do
+        # Prozesse auf HDD-Mounts (dynamisch aus HDD_MOUNTS)
+        for mnt in $HDD_MOUNTS; do
           [ -d "$mnt" ] || continue
           PROCS=$(fuser "$mnt" 2>/dev/null | tr ' ' '\n' | while read -r pid; do
             [ -n "$pid" ] || continue
@@ -366,7 +442,6 @@ check_hdd_io() {
       PREV="$CURR"
     done
   else
-    # Einmaliger Snapshot: aktuelle I/O-Rates aus /proc/diskstats
     info "Aktueller I/O-Status (Sektoren seit Boot):"
     for d in $HDD_DEVS; do
       LINE=$(grep " $d " /proc/diskstats 2>/dev/null)
@@ -380,10 +455,72 @@ check_hdd_io() {
     done
     printf '\n'
     info "Tipp: sh qnap-storage-advisor.sh --watch   fuer Live-Monitoring"
-    info "      Zeigt dann welche Prozesse die HDDs wach halten"
-    info "      Ideal: nachts laufen lassen um Sleep-Killer zu identifizieren"
   fi
   printf '\n'
+}
+
+# ── --detect: Config-Vorlage generieren ──────────────────────────────────────
+cmd_detect() {
+  HOSTNAME=$(hostname 2>/dev/null || echo "qnap")
+  QTS_VER=$(head -1 /etc/version 2>/dev/null || echo "unbekannt")
+  DATE=$(date '+%Y-%m-%d %H:%M:%S')
+
+  # Volumes dynamisch klassifizieren
+  build_mount_lists
+
+  # Paperless-Basispfad: erstes SSD-Volume nehmen falls vorhanden
+  BEST_SSD=$(echo "$SSD_MOUNTS" | awk '{print $1}')
+  DETECTED_PAPERLESS="${BEST_SSD:-/share/CACHEDEV1_DATA}/Container/paperless-ngx"
+
+  # Ausgabe als gueltiges sh-Sourceable Config-File
+  cat << EOF
+# =============================================================================
+# nas.conf -- NAS-spezifische Konfiguration fuer qnap-storage-advisor
+# =============================================================================
+#
+# Generiert von: sh qnap-storage-advisor.sh --detect
+# Datum        : $DATE
+# Hostname     : $HOSTNAME
+# QTS          : $QTS_VER
+#
+# WICHTIG: Diese Datei enthaelt NAS-spezifische Pfade und Einstellungen.
+# Sie wird NICHT ins Git-Repo eingecheckt (steht in .gitignore).
+# Fuer andere Entwickler: siehe nas.conf.example als Vorlage.
+#
+# Zum Verwenden:
+#   sh qnap-storage-advisor.sh --config nas.conf
+#   sh qnap-storage-advisor.sh --watch  --config nas.conf
+# =============================================================================
+
+# NAS-Bezeichnung (erscheint in Reports und Logs)
+NAS_LABEL="$HOSTNAME"
+
+# ---------------------------------------------------------------------------
+# Paperless-ngx Basispfad
+# ---------------------------------------------------------------------------
+# Automatisch ermittelt: erstes SSD-Volume wird fuer db/redis/data bevorzugt.
+# Anpassen falls ein anderer Pfad gewuenscht ist.
+PAPERLESS_BASE="$DETECTED_PAPERLESS"
+
+# ---------------------------------------------------------------------------
+# Volume-Klassifikation
+# ---------------------------------------------------------------------------
+# Automatisch via /sys/block/*/queue/rotational ermittelt.
+# Kann manuell ueberschrieben werden falls die Erkennung falsch liegt
+# (z.B. bei SSD-Drives die sich als rotational melden).
+#
+# Format: space-separated Pfade
+SSD_MOUNTS="$SSD_MOUNTS"
+HDD_MOUNTS="$HDD_MOUNTS"
+
+# ---------------------------------------------------------------------------
+# Zusaetzliche Sleep-Killer-Dienste (QNAP-spezifisch)
+# ---------------------------------------------------------------------------
+# Dienste die zusaetzlich zu den Defaults (mediasrv, photostation,
+# qmultimedia, Qsirch) auf HDD-I/O ueberwacht werden sollen.
+# Format: space-separated Prozessnamen (exakt wie in 'ps')
+EXTRA_SLEEP_KILLERS=""
+EOF
 }
 
 # ── Zusammenfassung ───────────────────────────────────────────────────────────
@@ -403,27 +540,36 @@ print_summary() {
   fi
   printf '\n'
   info "Doku   : https://github.com/KonradLanz/qnap-storage-advisor"
-  info "Watch  : sh qnap-storage-advisor.sh --watch"
+  info "Config : sh qnap-storage-advisor.sh --detect > nas.conf"
   hr
 }
 
+# ── main ─────────────────────────────────────────────────────────────────────
 main() {
-  print_header
-  if [ "$MODE" = "--watch" ]; then
-    # Im Watch-Modus nur den I/O-Daemon starten
-    check_hdd_io
-  else
-    check_disk_types
-    check_raid
-    check_mounts
-    check_docker_root
-    check_hdd_sleep_killers
-    check_paperless_volumes
-    check_setup_recommendation
-    check_hdd_io
-    print_summary
-    exit "$EXIT_CODE"
-  fi
+  case "$MODE" in
+    detect)
+      cmd_detect
+      ;;
+    watch)
+      build_mount_lists
+      print_header
+      check_hdd_io
+      ;;
+    *)
+      build_mount_lists
+      print_header
+      check_disk_types
+      check_raid
+      check_mounts
+      check_docker_root
+      check_hdd_sleep_killers
+      check_paperless_volumes
+      check_setup_recommendation
+      check_hdd_io
+      print_summary
+      exit "$EXIT_CODE"
+      ;;
+  esac
 }
 
 main

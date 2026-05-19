@@ -1,0 +1,63 @@
+# =============================================================================
+# nas.conf.example -- Vorlage fuer NAS-spezifische Konfiguration
+# =============================================================================
+#
+# Diese Datei ist eine VORLAGE fuer Entwickler und neue Installationen.
+# Die echte nas.conf wird per --detect generiert und ist NAS-spezifisch.
+#
+# Workflow:
+#   1. Auf dem NAS einmalig ausfuehren:
+#        sh qnap-storage-advisor.sh --detect > nas.conf
+#
+#   2. Optional: nas.conf pruefen und anpassen
+#        cat nas.conf
+#
+#   3. Danach verwenden:
+#        sh qnap-storage-advisor.sh --config nas.conf
+#        sh qnap-storage-advisor.sh --watch  --config nas.conf
+#
+# HINWEIS:
+#   nas.conf steht in .gitignore und wird nicht eingecheckt.
+#   Sie ist NAS-spezifisch und enthaelt lokale Pfade.
+#   Dieses nas.conf.example dient als Dokumentation und Fallback.
+#
+# PLATTFORMEN:
+#   Getestet auf: QNAP TVS-x73e (QTS 5.x), busybox ash
+#   Kompatibel mit: dash, bash 3.2+, bash 5+
+# =============================================================================
+
+# NAS-Bezeichnung (erscheint in Reports und Logs)
+# Wird von --detect automatisch auf $(hostname) gesetzt
+NAS_LABEL="QNAP NAS"
+
+# ---------------------------------------------------------------------------
+# Paperless-ngx Basispfad
+# ---------------------------------------------------------------------------
+# Der Ordner unter dem paperless-ngx seine Volumes ablegt.
+# --detect waehlt automatisch das erste SSD-Volume.
+# Beispiel TVS-x73e: /share/CACHEDEV2_DATA/Container/paperless-ngx
+PAPERLESS_BASE="/share/Container/paperless-ngx"
+
+# ---------------------------------------------------------------------------
+# Volume-Klassifikation
+# ---------------------------------------------------------------------------
+# Leer lassen = automatisch via /sys/block/*/queue/rotational erkannt.
+# Manuell setzen wenn die Kernel-Erkennung falsch liegt (selten).
+#
+# Beispiel eines QNAP TVS-x73e mit 1x SSD-Pool + 1x HDD-RAID6:
+#   SSD_MOUNTS="/share/CACHEDEV2_DATA"
+#   HDD_MOUNTS="/share/CACHEDEV1_DATA /share/CACHEDEV8_DATA"
+#
+# Format: space-separated absolute Pfade
+SSD_MOUNTS=""
+HDD_MOUNTS=""
+
+# ---------------------------------------------------------------------------
+# Zusaetzliche Sleep-Killer-Dienste
+# ---------------------------------------------------------------------------
+# Das Skript prueft standardmaessig: mediasrv, photostation, qmultimedia, Qsirch
+# Hier koennen weitere NAS-spezifische Prozesse ergaenzt werden.
+# Prozessnamen exakt wie in 'ps' / 'pgrep' angeben.
+#
+# Beispiel: EXTRA_SLEEP_KILLERS="surveillance_station musicstation"
+EXTRA_SLEEP_KILLERS=""

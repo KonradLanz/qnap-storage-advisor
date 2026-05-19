@@ -1,67 +1,87 @@
 # qnap-storage-advisor
 
-Analysiert die Festplatten- und Storage-Konfiguration auf QNAP NAS und gibt konkrete Empfehlungen für:
+Analysiert die Festplatten- und Storage-Konfiguration auf QNAP NAS und gibt konkrete Empfehlungen fuer:
 
 - **HDD-Sleep** — welche Workloads HDD-Spin-down verhindern und wie man das behebt
-- **SSD-Caching** — ob ein SSD-Cache sinnvoll wäre und welche Größe
-- **Tiered Storage** — ob ein dediziertes SSD-Volume für Docker/Container sinnvoll ist
+- **SSD-Caching** — ob ein SSD-Cache sinnvoll waere und welche Groesse
+- **Tiered Storage** — ob ein dediziertes SSD-Volume fuer Docker/Container sinnvoll ist
 - **Container-Workloads** — DB-Volumes (Postgres, Redis) auf SSD, Media auf HDD
 
-## Verwendung
+## Schnellstart
 
 ```sh
-# Direkt ausführen
-curl -fsSL https://raw.githubusercontent.com/KonradLanz/qnap-storage-advisor/main/qnap-storage-advisor.sh | sh
-
-# Oder klonen
-git clone https://github.com/KonradLanz/qnap-storage-advisor.git
-cd qnap-storage-advisor
+# Direkt ausfuehren (auto-detect)
 sh qnap-storage-advisor.sh
+
+# Empfohlen: erst NAS-Config generieren, dann verwenden
+sh qnap-storage-advisor.sh --detect > nas.conf
+sh qnap-storage-advisor.sh --config nas.conf
+
+# Live-Monitoring (zeigt welche Prozesse HDDs wach halten)
+sh qnap-storage-advisor.sh --watch --config nas.conf
 ```
 
-## Integration mit paperless-ngx-qnap-bootstrap
+## NAS-Konfiguration (`nas.conf`)
 
-Das Skript wird automatisch von `paperless-qnap-prepare.sh --check-storage` aufgerufen.
-Siehe: [paperless-ngx-qnap-bootstrap](https://github.com/KonradLanz/paperless-ngx-qnap-bootstrap)
+Das Skript funktioniert ohne Config via Auto-Detect. Fuer wiederkehrende Nutzung
+empfiehlt sich eine `nas.conf` die NAS-spezifische Pfade und Einstellungen festhaelt.
+
+```sh
+# Einmalig auf dem NAS ausfuehren:
+sh qnap-storage-advisor.sh --detect > nas.conf
+cat nas.conf   # pruefen, ggf. anpassen
+```
+
+Die `nas.conf` wird **nicht** ins Repo eingecheckt (`.gitignore`) --
+sie ist NAS-spezifisch und bleibt lokal auf dem Geraet.
+Siehe [`nas.conf.example`](./nas.conf.example) als dokumentierte Vorlage.
+
+## Modi
+
+| Befehl | Beschreibung |
+|---|---|
+| `sh qnap-storage-advisor.sh` | Einmaliger Check, alle Volumes auto-erkannt |
+| `sh qnap-storage-advisor.sh --config nas.conf` | Check mit NAS-spezifischer Config |
+| `sh qnap-storage-advisor.sh --detect` | `nas.conf` automatisch generieren |
+| `sh qnap-storage-advisor.sh --watch` | Live HDD-I/O Monitoring |
+| `sh qnap-storage-advisor.sh --watch --config nas.conf` | Live Monitoring mit Config |
 
 ## Was wird analysiert?
 
-| Check | Befehl | Zweck |
+| Check | Quelle | Zweck |
 |---|---|---|
-| Disk-Typen | `hdparm`, `/sys/block/*/queue/rotational` | SSD vs. HDD erkennen |
+| Disk-Typen | `/sys/block/*/queue/rotational` | SSD vs. HDD erkennen |
 | RAID-Konfiguration | `/proc/mdstat` | RAID-Level und Mitglieder |
-| Mount-Punkte | `df -h`, `mount` | Wo liegt was |
+| Mount-Punkte | `df -h` + rotational | Alle CACHEDEVs klassifizieren |
 | Docker-Root | `docker info` | Auf SSD oder HDD? |
-| HDD-Sleep-Killer | `lsof`, `fuser` | Prozesse die HDD wach halten |
-| I/O-Last | `iostat` (falls verfügbar) | Wer schreibt wie viel |
-| Speicherauslastung | `df` | Freier Platz pro Volume |
-
-## Empfehlungslogik
-
-```
-Docker-Root auf HDD?
-  → Empfehle SSD-Cache ODER separates SSD-Volume für Container
-
-Postgres/Redis-Volumes auf HDD?
-  → WARN: Datenbank-I/O verhindert HDD-Sleep, Performance-Einbußen
-
-HDD-Sleep aktiviert aber Container laufen?
-  → INFO: Container mit restart:unless-stopped halten HDD wach
-     Lösung: SSD-Tier für db/ und redis/, HDD für media/ und consume/
-
-Nur HDDs vorhanden, kein SSD?
-  → Empfehle: 1× M.2 NVMe SSD als dedizierten Cache oder Docker-Volume
-```
+| HDD-Sleep-Killer | `pgrep`, `fuser` | Prozesse die HDD wach halten |
+| Paperless-Volumes | Pfad-Analyse | Optimale SSD/HDD-Aufteilung |
+| Setup-Empfehlung | Kombination aller Checks | Konkrete Tiered-Storage-Empfehlung |
+| I/O-Aktivitaet | `/proc/diskstats` | Wer schreibt auf welche HDD |
 
 ## Getestete Modelle
 
 | Modell | QTS | Anmerkung |
 |---|---|---|
-| TVS-x73e | 5.2.9 | Vollständig verifiziert |
+| TVS-x73e | 5.2.x | Vollstaendig verifiziert |
 
-PR willkommen für weitere Modelle.
+PR willkommen fuer weitere Modelle -- bitte `--detect`-Output als Issue beifuegen.
+
+## Fuer Entwickler / andere NAS-Modelle
+
+Das Skript vermeidet NAS-spezifische Hardcodierungen:
+- Alle CACHEDEV-Volumes werden **dynamisch** per `/sys/block` klassifiziert
+- `path_is_rotational()` folgt md-RAID-Slaves automatisch
+- NAS-spezifische Pfade kommen ausschliesslich aus `nas.conf`
+
+Um das Skript auf einem neuen QNAP-Modell zu testen:
+```sh
+git clone https://github.com/KonradLanz/qnap-storage-advisor.git
+cd qnap-storage-advisor
+sh qnap-storage-advisor.sh --detect   # zeigt was erkannt wird
+```
 
 ## Lizenz
 
-AGPLv3 — https://www.gnu.org/licenses/agpl-3.0.html  
+AGPLv3 -- https://www.gnu.org/licenses/agpl-3.0.html  
 Copyright (c) 2026 GrEEV.com KG

@@ -1,0 +1,11 @@
+# NAS-spezifische Config -- wird per --detect generiert, nicht einchecken
+nas.conf
+
+# Logs
+*.log
+
+# Temporaere Dateien
+*.tmp
+*.swp
+*~
+.DS_Store
